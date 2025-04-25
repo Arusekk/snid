@@ -46,21 +46,21 @@ type Server struct {
 
 func (server *Server) peekClientHello(clientConn net.Conn) (*tls.ClientHelloInfo, net.Conn, error) {
 	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return nil, nil, err
+		return nil, clientConn, err
 	}
 
 	clientHello, peekedClientConn, err := tlsutil.PeekClientHelloFromConn(clientConn)
 	if err != nil {
-		return nil, nil, err
+		return nil, peekedClientConn, err
 	}
 
 	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
-		return nil, nil, err
+		return nil, peekedClientConn, err
 	}
 
 	if clientHello.ServerName == "" {
 		if server.DefaultHostname == "" {
-			return nil, nil, errors.New("no SNI provided and DefaultHostname not set")
+			return nil, peekedClientConn, errors.New("no SNI provided and DefaultHostname not set")
 		}
 		clientHello.ServerName = server.DefaultHostname
 	}
@@ -68,13 +68,41 @@ func (server *Server) peekClientHello(clientConn net.Conn) (*tls.ClientHelloInfo
 	return clientHello, peekedClientConn, err
 }
 
+func (server *Server) peekMinecraftHello(clientConn net.Conn) (string, net.Conn, error) {
+	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return "", nil, err
+	}
+
+	serverName, peekedClientConn, err := peekMinecraftHelloFromConn(clientConn)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
+		return "", nil, err
+	}
+
+	if serverName == "" {
+		if server.DefaultHostname == "" {
+			return "", nil, errors.New("no SNI provided and DefaultHostname not set")
+		}
+		serverName = server.DefaultHostname
+	}
+
+	return serverName, peekedClientConn, err
+}
+
 func (server *Server) handleConnection(clientConn net.Conn) {
 	defer func() { clientConn.Close() }()
 
-	var clientHello *tls.ClientHelloInfo
+	serverName := ""
+	supportedProtos := []string{}
 
 	if peekedClientHello, peekedClientConn, err := server.peekClientHello(clientConn); err == nil {
-		clientHello = peekedClientHello
+		serverName = peekedClientHello.ServerName
+		supportedProtos = peekedClientHello.SupportedProtos
+		clientConn = peekedClientConn
+	} else if serverName, peekedClientConn, err = server.peekMinecraftHello(peekedClientConn); err == nil {
 		clientConn = peekedClientConn
 	} else {
 		if !errors.Is(err, io.EOF) && !os.IsTimeout(err) {
@@ -85,9 +113,9 @@ func (server *Server) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	backendConn, err := server.Backend.Dial(clientHello.ServerName, clientHello.SupportedProtos, clientConn)
+	backendConn, err := server.Backend.Dial(serverName, supportedProtos, clientConn)
 	if err != nil {
-		log.Printf("Ignoring connection from %s to %s because dialing backend failed: %s", clientConn.RemoteAddr(), clientHello.ServerName, err)
+		log.Printf("Ignoring connection from %s to %s because dialing backend failed: %s", clientConn.RemoteAddr(), serverName, err)
 		return
 	}
 	defer backendConn.Close()
